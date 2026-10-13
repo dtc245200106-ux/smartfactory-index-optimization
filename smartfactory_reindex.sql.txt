@@ -1,0 +1,146 @@
+-- ============================================================
+-- HỆ THỐNG SMARTFACTORY - TỐI ƯU HÓA INDEX
+-- Phiên bản: 2.0 - Lean Index thay Fat Index
+-- Tác giả: Database Optimization Expert
+-- Ngày: 2026
+-- ============================================================
+
+-- ============================================
+-- PHẦN 1: TẠO DATABASE VÀ BẢNG (LEGACY)
+-- ============================================
+DROP DATABASE IF EXISTS smartfactory_db;
+CREATE DATABASE smartfactory_db
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+USE smartfactory_db;
+
+CREATE TABLE SensorLogs (
+    log_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sensor_id INT NOT NULL,
+    recorded_at DATETIME NOT NULL,
+    temperature DECIMAL(5, 2),
+    humidity DECIMAL(5, 2),
+    status VARCHAR(20)   -- 'NORMAL', 'WARNING', 'CRITICAL'
+);
+
+-- ============================================
+-- PHẦN 2: TẠO "FAT INDEX" (THẢM HỌA)
+-- ============================================
+CREATE INDEX idx_fat_covering 
+    ON SensorLogs(sensor_id, recorded_at, temperature, humidity, status);
+
+-- ============================================
+-- PHẦN 3: CHÈN 1 TRIỆU DÒNG DỮ LIỆU MẪU
+-- ============================================
+-- Để thấy rõ sự khác biệt về Storage & Performance
+DELIMITER //
+CREATE PROCEDURE insert_sensor_data()
+BEGIN
+    DECLARE i INT DEFAULT 0;
+    WHILE i < 1000000 DO
+        INSERT INTO SensorLogs (sensor_id, recorded_at, temperature, humidity, status)
+        VALUES (
+            FLOOR(1 + RAND() * 10000),
+            DATE_SUB(NOW(), INTERVAL FLOOR(RAND() * 365) DAY),
+            ROUND(20 + RAND() * 20, 2),
+            ROUND(40 + RAND() * 40, 2),
+            ELT(FLOOR(1 + RAND() * 3), 'NORMAL', 'WARNING', 'CRITICAL')
+        );
+        SET i = i + 1;
+    END WHILE;
+END //
+DELIMITER ;
+
+CALL insert_sensor_data();
+
+-- ============================================
+-- PHẦN 4: KIỂM TRA DUNG LƯỢNG TRƯỚC TỐI ƯU
+-- ============================================
+-- Cách 1: SHOW TABLE STATUS
+SHOW TABLE STATUS LIKE 'SensorLogs';
+
+-- Cách 2: information_schema (chi tiết, MB)
+SELECT 
+    TABLE_NAME AS 'Bảng',
+    ROUND(DATA_LENGTH / 1024 / 1024, 2) AS 'Data (MB)',
+    ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS 'Index (MB)',
+    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS 'Total (MB)'
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'smartfactory_db'
+  AND TABLE_NAME = 'SensorLogs';
+
+-- Xem danh sách Index
+SHOW INDEX FROM SensorLogs;
+
+-- ============================================
+-- PHẦN 5: TỐI ƯU HÓA - DROP FAT INDEX, TẠO LEAN INDEX
+-- ============================================
+
+-- ❌ Bước 5.1: XÓA FAT INDEX
+ALTER TABLE SensorLogs DROP INDEX idx_fat_covering;
+
+-- ✅ Bước 5.2: TẠO LEAN INDEX (chỉ 2 cột cần thiết cho WHERE + ORDER BY)
+CREATE INDEX idx_lean_search ON SensorLogs(sensor_id, recorded_at);
+
+-- ============================================
+-- PHẦN 6: KIỂM TRA DUNG LƯỢNG SAU TỐI ƯU
+-- ============================================
+SELECT 
+    TABLE_NAME AS 'Bảng',
+    ROUND(DATA_LENGTH / 1024 / 1024, 2) AS 'Data (MB)',
+    ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS 'Index (MB)',
+    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS 'Total (MB)'
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'smartfactory_db'
+  AND TABLE_NAME = 'SensorLogs';
+
+-- Xem lại danh sách Index
+SHOW INDEX FROM SensorLogs;
+
+-- ============================================
+-- PHẦN 7: EXPLAIN SO SÁNH TRƯỚC VÀ SAU
+-- ============================================
+
+-- 7.1. Truy vấn Dashboard
+-- SELECT temperature, humidity, status FROM SensorLogs 
+-- WHERE sensor_id = 105 AND recorded_at >= '2026-06-20';
+
+EXPLAIN 
+SELECT temperature, humidity, status 
+FROM SensorLogs 
+WHERE sensor_id = 105 
+  AND recorded_at >= '2026-06-20';
+
+-- KẾT QUẢ MONG ĐỢI:
+-- Trước tối ưu: key = idx_fat_covering, Extra = 'Using index' (Covering Index)
+-- Sau tối ưu:   key = idx_lean_search,  Extra = 'Using index condition' 
+--               (hoặc NULL - phải lookup table)
+
+-- ============================================
+-- PHẦN 8: ĐO THỜI GIAN INSERT
+-- ============================================
+SET profiling = 1;
+
+-- Insert 100 dòng để đo
+INSERT INTO SensorLogs (sensor_id, recorded_at, temperature, humidity, status)
+VALUES 
+    (1, NOW(), 25.5, 60.0, 'NORMAL'),
+    (2, NOW(), 26.1, 61.2, 'NORMAL'),
+    (3, NOW(), 27.3, 58.5, 'WARNING');
+
+SHOW PROFILES;
+
+-- ============================================
+-- PHẦN 9: KIỂM TRA KÍCH THƯỚC CỘT
+-- ============================================
+-- Tính dung lượng của từng cột trong Index cũ
+SELECT 
+    COLUMN_NAME,
+    DATA_TYPE,
+    CHARACTER_MAXIMUM_LENGTH,
+    NUMERIC_PRECISION,
+    NUMERIC_SCALE
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'smartfactory_db' 
+  AND TABLE_NAME = 'SensorLogs'
+ORDER BY ORDINAL_POSITION;
